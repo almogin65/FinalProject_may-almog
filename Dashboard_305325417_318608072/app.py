@@ -12,24 +12,77 @@ from pathlib import Path
 
 st.set_page_config(page_title="Injury Score Only", layout="wide")
 
-# -----------------------------------------------------------------------------
-# Resolve all paths relative to THIS file (works even if Streamlit runs elsewhere)
-# -----------------------------------------------------------------------------
+# ============================================================
+# Robust path resolution (works if app lives in a subfolder)
+# ============================================================
 APP_DIR = Path(__file__).resolve().parent
-MODEL_PATH   = APP_DIR / "catboost_model.pkl"
-DATA_PATH    = APP_DIR / "processed_data.csv"
-KEPLER_PATH  = APP_DIR / "kepler_map.html"
-FOLIUM_PATH  = APP_DIR / "my_folium_map.html"
+CWD = Path.cwd()
 
-def _must_exist(p: Path, label: str):
-    if not p.exists():
-        st.error(f"❌ Could not find **{label}** at: `{p}`")
+def _repo_root(start: Path) -> Path:
+    """Walk up until we find a likely repo root (.git / pyproject / requirements), else filesystem root."""
+    for p in [start, *start.parents]:
+        if (p / ".git").exists() or (p / "pyproject.toml").exists() or (p / "requirements.txt").exists():
+            return p
+    # drive root on Windows, '/' on Unix
+    return Path(start.anchor) if start.anchor else start
+
+REPO_ROOT = _repo_root(APP_DIR)
+
+def find_file(filename: str, preferred_subdir: str | None = None) -> Path | None:
+    """Try several locations; fall back to a repo-wide search."""
+    candidates = []
+    # 1) Next to the app
+    candidates.append(APP_DIR / filename)
+    if preferred_subdir:
+        candidates.append(APP_DIR / preferred_subdir / filename)
+    # 2) Common bases
+    for base in {CWD, APP_DIR.parent, REPO_ROOT}:
+        candidates.append(base / filename)
+        if preferred_subdir:
+            candidates.append(base / preferred_subdir / filename)
+    for c in candidates:
+        if c.exists():
+            return c
+    # 3) Repo-wide search
+    try:
+        return next(REPO_ROOT.rglob(filename))
+    except StopIteration:
+        return None
+
+# If your assets are under a fixed subfolder (e.g. "assets"), set it here.
+ASSETS_SUBDIR = None  # e.g. "assets"
+
+MODEL_PATH  = find_file("catboost_model.pkl",  ASSETS_SUBDIR)
+DATA_PATH   = find_file("processed_data.csv",  ASSETS_SUBDIR)
+KEPLER_PATH = find_file("kepler_map.html",     ASSETS_SUBDIR)
+FOLIUM_PATH = find_file("my_folium_map.html",  ASSETS_SUBDIR)
+
+# Show what we resolved (handy on Streamlit Cloud)
+with st.expander("Debug: paths"):
+    st.write("APP_DIR:", str(APP_DIR))
+    st.write("CWD:", str(CWD))
+    st.write("REPO_ROOT:", str(REPO_ROOT))
+    st.write("MODEL_PATH:", str(MODEL_PATH) if MODEL_PATH else "❌ not found")
+    st.write("DATA_PATH:", str(DATA_PATH) if DATA_PATH else "❌ not found")
+    st.write("KEPLER_PATH:", str(KEPLER_PATH) if KEPLER_PATH else "❌ not found")
+    st.write("FOLIUM_PATH:", str(FOLIUM_PATH) if FOLIUM_PATH else "❌ not found")
+
+def _need(path: Path | None, label: str):
+    if path is None:
+        st.error(
+            f"❌ Missing required file **{label}** (`{label}`) anywhere under `{REPO_ROOT}`.\n"
+            f"Place it next to `app.py` or set `ASSETS_SUBDIR` if it lives in a subfolder."
+        )
         st.stop()
 
-_must_exist(MODEL_PATH, "model file")
-_must_exist(DATA_PATH, "processed data CSV")
-_must_exist(KEPLER_PATH, "Kepler map HTML")
-_must_exist(FOLIUM_PATH, "Folium map HTML")
+# Required: model & data. Maps are optional.
+_need(MODEL_PATH, "catboost_model.pkl")
+_need(DATA_PATH, "processed_data.csv")
+
+if KEPLER_PATH is None:
+    st.warning("Kepler map not found; that panel will be hidden.")
+if FOLIUM_PATH is None:
+    st.warning("Folium map not found; that panel will be hidden.")
 
 # === Top header: title (left) + score (right) ===
 hdr_left, hdr_right = st.columns([6, 1])
@@ -40,11 +93,10 @@ with hdr_right:
     score_top = st.empty()      # upper-right metric
     caption_top = st.empty()    # small caption under the metric
 
-# --- Load trained model ---
-with MODEL_PATH.open("rb") as model_file:
-    model = pickle.load(model_file)
+# --- Load trained model & data ---
+with open(MODEL_PATH, "rb") as fh:
+    model = pickle.load(fh)
 
-# --- Load dataset for categorical options ---
 df = pd.read_csv(DATA_PATH, index_col=0).drop(columns="Injury Severity", errors="ignore")
 
 # ---- Feature schema (your list) ----
@@ -57,15 +109,12 @@ feature_names = [
  'Vehicle Make','Crash Hour','Crash Day','Crash Month','h3_index'
 ]
 
-# (Optional) quick sanity check if lengths align; won’t stop the app
-try:
-    _ = len(model.feature_names_)
-except Exception:
-    pass
-
 # Features to treat as numeric; others are categorical/text
-numeric_features = {'Speed Limit','Vehicle Year','Crash Hour','Crash Day','Crash Month','Latitude','Longitude'}
-# If your h3_index is numeric, add: numeric_features.add('h3_index')
+numeric_features = {
+    'Speed Limit','Vehicle Year','Crash Hour','Crash Day','Crash Month','Latitude','Longitude'
+}
+# If your h3_index is numeric, uncomment the next line:
+# numeric_features.add('h3_index')
 
 # Define constraints for numeric features
 numeric_constraints = {
@@ -122,7 +171,7 @@ with st.form("manual_input"):
     user_row = {}
     input_cols = [col1, col2, col3, col4]
 
-    # NOTE: This loops over model feature_names (includes 'h3_index')
+    # Loop over model feature_names (includes 'h3_index')
     for i, feat in enumerate(feature_names):
         with input_cols[i % 4]:
             if feat in numeric_features:
@@ -186,19 +235,21 @@ if submitted:
 # Create two columns for maps
 col_left, col_right = st.columns([1, 1])
 
-# --- Left column: Kepler Map ---
-with col_left:
-    with KEPLER_PATH.open("r", encoding="utf-8") as f:
-        kepler_html = f.read()
-    st.subheader("Kepler Map")
-    html(kepler_html, height=500)
+# --- Left column: Kepler Map (optional) ---
+if KEPLER_PATH:
+    with col_left:
+        with open(KEPLER_PATH, "r", encoding="utf-8") as f:
+            kepler_html = f.read()
+        st.subheader("Kepler Map")
+        html(kepler_html, height=500)
 
-# --- Right column: Folium Map ---
-with col_right:
-    with FOLIUM_PATH.open("r", encoding="utf-8") as f:
-        folium_html = f.read()
-    st.subheader("Folium Map")
-    html(folium_html, height=400)
+# --- Right column: Folium Map (optional) ---
+if FOLIUM_PATH:
+    with col_right:
+        with open(FOLIUM_PATH, "r", encoding="utf-8") as f:
+            folium_html = f.read()
+        st.subheader("Folium Map")
+        html(folium_html, height=400)
 
 # --- Feature importance section ---
 st.subheader("Feature Importance")
@@ -219,14 +270,3 @@ st.bar_chart(
     fi_df.head(top_n).set_index("Feature")["Importance"],
     use_container_width=True
 )
-
-# Optional: show where files were loaded from (handy when deploying)
-with st.expander("Debug: file locations"):
-    st.code(
-        f"APP_DIR   = {APP_DIR}\n"
-        f"MODEL     = {MODEL_PATH}\n"
-        f"DATA      = {DATA_PATH}\n"
-        f"KEPLER    = {KEPLER_PATH}\n"
-        f"FOLIUM    = {FOLIUM_PATH}\n",
-        language="text"
-    )
